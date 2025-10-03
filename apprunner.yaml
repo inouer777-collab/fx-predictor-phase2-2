@@ -13,7 +13,7 @@ build:
       - python -c "import dateutil; print('✅ python-dateutil available')"
       - echo "🎯 Phase 2.2 build completed successfully"
 run:
-  runtime-version: 3.11.9
+  runtime-version: 3.9
   command: python aws_fx_phase2_2.py
   network:
     port: 8080
