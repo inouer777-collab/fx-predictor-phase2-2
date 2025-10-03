@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 2.2 Live API Edition: FX予測アプリ - Live API確実取得版
-- より確実なAPI接続戦略
-- AWS App Runner環境最適化
-- 複数エンドポイント + 改善されたエラーハンドリング
+Phase 2.2 Manual Rate Edition: FX予測アプリ - 手動レート設定対応版
+- Live API + 手動レート設定機能
+- 現実的シミュレーション時の利用者レート入力
+- 自動/手動モード切替機能
 """
 
 import http.server
@@ -135,11 +135,83 @@ class TimezoneManager:
         current_hour = market_time.hour + market_time.minute / 60.0
         return hours["open"] <= current_hour <= hours["close"]
 
-class EnhancedFXDataProvider:
-    """強化されたFXデータプロバイダー（Live API確実取得版）"""
+class ManualRateManager:
+    """手動レート管理クラス（新機能）"""
     
     def __init__(self):
-        # より確実なAPI戦略
+        self.rate_ranges = {
+            "USD/JPY": {"min": 80.0, "max": 250.0, "decimal": 3},
+            "EUR/JPY": {"min": 100.0, "max": 300.0, "decimal": 4},
+            "EUR/USD": {"min": 0.5, "max": 2.0, "decimal": 4}
+        }
+        
+        self.default_rates = {
+            "USD/JPY": 147.49,
+            "EUR/JPY": 173.16,
+            "EUR/USD": 1.174
+        }
+    
+    def validate_manual_rate(self, pair: str, rate: float) -> Dict[str, Any]:
+        """手動入力レートの検証"""
+        try:
+            rate = float(rate)
+            
+            if pair not in self.rate_ranges:
+                return {
+                    "valid": False,
+                    "error": f"未対応の通貨ペア: {pair}"
+                }
+            
+            range_info = self.rate_ranges[pair]
+            min_rate = range_info["min"]
+            max_rate = range_info["max"]
+            
+            if rate < min_rate or rate > max_rate:
+                return {
+                    "valid": False,
+                    "error": f"{pair}の有効範囲: {min_rate} - {max_rate}"
+                }
+            
+            # 小数点以下の桁数チェック
+            decimal_places = len(str(rate).split('.')[-1]) if '.' in str(rate) else 0
+            if decimal_places > range_info["decimal"]:
+                return {
+                    "valid": False,
+                    "error": f"{pair}の小数点以下は{range_info['decimal']}桁まで"
+                }
+            
+            return {
+                "valid": True,
+                "rate": round(rate, range_info["decimal"]),
+                "formatted_rate": round(rate, range_info["decimal"])
+            }
+            
+        except (ValueError, TypeError):
+            return {
+                "valid": False,
+                "error": "数値を入力してください"
+            }
+    
+    def get_default_rate(self, pair: str) -> float:
+        """デフォルトレート取得"""
+        return self.default_rates.get(pair, 100.0)
+    
+    def get_rate_info(self, pair: str) -> Dict[str, Any]:
+        """レート情報取得"""
+        range_info = self.rate_ranges.get(pair, {"min": 0, "max": 1000, "decimal": 4})
+        return {
+            "pair": pair,
+            "min": range_info["min"],
+            "max": range_info["max"],
+            "decimal": range_info["decimal"],
+            "default": self.default_rates.get(pair, 100.0),
+            "example": f"{self.default_rates.get(pair, 100.0):.{range_info['decimal']}f}"
+        }
+
+class EnhancedFXDataProvider:
+    """強化されたFXデータプロバイダー（手動レート対応版）"""
+    
+    def __init__(self):
         self.api_configs = [
             {
                 "name": "exchangerate-api",
@@ -184,7 +256,6 @@ class EnhancedFXDataProvider:
             }
         ]
         
-        # 現実的なフォールバックレート
         self.fallback_rates = {
             "USD/JPY": 147.49,
             "EUR/JPY": 173.16,
@@ -192,17 +263,30 @@ class EnhancedFXDataProvider:
         }
         
         self.timezone_manager = TimezoneManager()
-        
-        # API成功ログ
+        self.manual_rate_manager = ManualRateManager()
         self.last_successful_api = None
         self.api_success_count = {}
     
-    def get_real_fx_rate(self, pair: str, timezone: str = "UTC") -> Dict[str, Any]:
-        """Live FXレート取得（強化版）"""
+    def get_real_fx_rate(self, pair: str, timezone: str = "UTC", manual_rate: Optional[float] = None) -> Dict[str, Any]:
+        """FXレート取得（手動レート対応版）"""
+        
+        # 手動レートが指定されている場合
+        if manual_rate is not None:
+            validation = self.manual_rate_manager.validate_manual_rate(pair, manual_rate)
+            if validation["valid"]:
+                return self._create_manual_rate_response(pair, validation["rate"], timezone)
+            else:
+                print(f"⚠️ 手動レート検証失敗: {validation['error']}")
+                # 検証失敗時はAPI取得を試行
         
         if not REQUESTS_AVAILABLE:
             print("⚠️ requests不可 - 標準ライブラリでAPI試行")
-            return self._try_urllib_apis(pair, timezone)
+            result = self._try_urllib_apis(pair, timezone)
+            if result["source"] != "Live API":
+                # API失敗時は手動入力を促す
+                result["manual_input_required"] = True
+                result["rate_info"] = self.manual_rate_manager.get_rate_info(pair)
+            return result
         
         print(f"🔄 Live API取得開始: {pair}")
         
@@ -215,7 +299,6 @@ class EnhancedFXDataProvider:
                 try:
                     print(f"🔄 [{api_idx+1}/{len(self.api_configs)}] {api_name} 試行 {attempt+1}/{retries+1}")
                     
-                    # セッション作成（接続再利用）
                     session = requests.Session()
                     session.headers.update(api_config['headers'])
                     
@@ -223,7 +306,7 @@ class EnhancedFXDataProvider:
                         api_config['url'],
                         timeout=api_config['timeout'],
                         allow_redirects=True,
-                        verify=True  # SSL検証有効
+                        verify=True
                     )
                     
                     if response.status_code == 200:
@@ -233,7 +316,6 @@ class EnhancedFXDataProvider:
                         if result and result.get('rate', 0) > 0:
                             print(f"✅ {api_name} API成功! {pair} = {result['rate']}")
                             
-                            # 成功統計更新
                             self.last_successful_api = api_name
                             self.api_success_count[api_name] = self.api_success_count.get(api_name, 0) + 1
                             
@@ -243,7 +325,7 @@ class EnhancedFXDataProvider:
                         
                 except requests.exceptions.Timeout:
                     print(f"⏰ {api_name} タイムアウト (試行 {attempt+1})")
-                    time.sleep(0.5)  # 短時間待機
+                    time.sleep(0.5)
                     continue
                     
                 except requests.exceptions.ConnectionError:
@@ -263,8 +345,9 @@ class EnhancedFXDataProvider:
                     print(f"⚠️ {api_name} 予期しないエラー: {str(e)[:100]}")
                     continue
         
-        print("⚠️ 全API失敗 - 高品質フォールバック使用")
-        return self._get_high_quality_fallback(pair, timezone)
+        print("⚠️ 全API失敗 - 手動入力モードに移行")
+        result = self._get_manual_input_fallback(pair, timezone)
+        return result
     
     def _try_urllib_apis(self, pair: str, timezone: str) -> Dict[str, Any]:
         """標準ライブラリでのAPI試行"""
@@ -298,12 +381,11 @@ class EnhancedFXDataProvider:
                 print(f"⚠️ urllib API失敗: {str(e)[:100]}")
                 continue
         
-        return self._get_high_quality_fallback(pair, timezone)
+        return self._get_manual_input_fallback(pair, timezone)
     
     def _parse_api_data(self, data: Dict, pair: str, timezone: str, api_name: str) -> Optional[Dict[str, Any]]:
         """統一API データ解析"""
         try:
-            # exchangerate-api形式
             if 'rates' in data and 'base' in data:
                 rates = data['rates']
                 
@@ -319,7 +401,6 @@ class EnhancedFXDataProvider:
                 else:
                     rate = None
             
-            # exchangerate.host形式
             elif 'rates' in data:
                 rates = data['rates']
                 if pair == "USD/JPY":
@@ -333,12 +414,10 @@ class EnhancedFXDataProvider:
                 else:
                     rate = None
             
-            # その他の形式
             else:
                 print(f"⚠️ {api_name} 未知のデータ形式")
                 return None
             
-            # レート検証
             if rate and self._validate_rate(pair, rate):
                 current_time = datetime.datetime.now()
                 localized_time = self.timezone_manager.convert_to_timezone(current_time, timezone)
@@ -351,7 +430,8 @@ class EnhancedFXDataProvider:
                     "timezone": timezone,
                     "base_currency": data.get("base", "USD"),
                     "api_provider": api_name,
-                    "data_quality": "Live"
+                    "data_quality": "Live",
+                    "manual_input_required": False
                 }
             else:
                 print(f"⚠️ {api_name} 無効なレート: {rate}")
@@ -381,36 +461,47 @@ class EnhancedFXDataProvider:
         except (ValueError, TypeError):
             return False
     
-    def _get_high_quality_fallback(self, pair: str, timezone: str) -> Dict[str, Any]:
-        """高品質フォールバックレート"""
-        base_rate = self.fallback_rates.get(pair, 100.0)
-        
-        # 時間ベースの微小変動
-        current_hour = datetime.datetime.now().hour
-        time_variation = math.sin(current_hour * math.pi / 12) * 0.002
-        
-        # ランダム変動
-        random_variation = random.uniform(-0.003, 0.003)
-        
-        rate = base_rate * (1 + time_variation + random_variation)
-        
+    def _create_manual_rate_response(self, pair: str, rate: float, timezone: str) -> Dict[str, Any]:
+        """手動レートレスポンス作成"""
         current_time = datetime.datetime.now()
         localized_time = self.timezone_manager.convert_to_timezone(current_time, timezone)
         
         return {
             "rate": round(rate, 4),
-            "source": "High-Quality Simulation",
+            "source": "Manual Input",
             "timestamp": current_time.isoformat(),
             "localized_timestamp": localized_time.isoformat() if localized_time else current_time.isoformat(),
             "timezone": timezone,
             "base_currency": "USD",
-            "api_provider": "fallback-enhanced",
-            "data_quality": "Simulated",
-            "note": f"Last successful API: {self.last_successful_api or 'None'}"
+            "api_provider": "manual-user-input",
+            "data_quality": "User Provided",
+            "manual_input_required": False,
+            "note": "利用者が設定した現在レート"
+        }
+    
+    def _get_manual_input_fallback(self, pair: str, timezone: str) -> Dict[str, Any]:
+        """手動入力フォールバック"""
+        base_rate = self.fallback_rates.get(pair, 100.0)
+        
+        current_time = datetime.datetime.now()
+        localized_time = self.timezone_manager.convert_to_timezone(current_time, timezone)
+        
+        return {
+            "rate": round(base_rate, 4),
+            "source": "Manual Input Required",
+            "timestamp": current_time.isoformat(),
+            "localized_timestamp": localized_time.isoformat() if localized_time else current_time.isoformat(),
+            "timezone": timezone,
+            "base_currency": "USD",
+            "api_provider": "fallback-manual-required",
+            "data_quality": "Requires Manual Input",
+            "manual_input_required": True,
+            "rate_info": self.manual_rate_manager.get_rate_info(pair),
+            "note": f"API接続失敗 - 手動で現在レートを設定してください (Last API: {self.last_successful_api or 'None'})"
         }
 
 class FXPredictor:
-    """FX予測エンジン（Live API強化版）"""
+    """FX予測エンジン（手動レート対応版）"""
     
     def __init__(self):
         self.currency_pairs = ["USD/JPY", "EUR/JPY", "EUR/USD"]
@@ -424,9 +515,9 @@ class FXPredictor:
             "EUR/USD": 1.174
         }
     
-    def get_current_rate(self, pair: str, timezone: str = "UTC") -> Dict[str, Any]:
-        """現在レート取得（強化版）"""
-        return self.data_provider.get_real_fx_rate(pair, timezone)
+    def get_current_rate(self, pair: str, timezone: str = "UTC", manual_rate: Optional[float] = None) -> Dict[str, Any]:
+        """現在レート取得（手動レート対応版）"""
+        return self.data_provider.get_real_fx_rate(pair, timezone, manual_rate)
     
     def calculate_technical_indicators(self, rates: List[float]) -> Dict[str, float]:
         """テクニカル指標計算"""
@@ -459,11 +550,11 @@ class FXPredictor:
         }
     
     def predict_rate(self, pair: str, days_ahead: int = 1, use_business_days: bool = False, 
-                    timezone: str = "UTC", country: str = "JP") -> Dict[str, Any]:
-        """レート予測（強化版）"""
+                    timezone: str = "UTC", country: str = "JP", manual_rate: Optional[float] = None) -> Dict[str, Any]:
+        """レート予測（手動レート対応版）"""
         
         # 現在レート取得
-        current_data = self.get_current_rate(pair, timezone)
+        current_data = self.get_current_rate(pair, timezone, manual_rate)
         current_rate = current_data["rate"]
         
         # 営業日計算
@@ -513,10 +604,12 @@ class FXPredictor:
         if use_business_days:
             base_confidence += 5
         if current_data["source"] == "Live API":
-            base_confidence += 10  # Live APIデータは大幅信頼度向上
+            base_confidence += 10
+        elif current_data["source"] == "Manual Input":
+            base_confidence += 8  # 手動入力も高信頼度
         confidence = min(95, base_confidence)
         
-        return {
+        result = {
             "current_rate": current_rate,
             "current_data_source": current_data["source"],
             "predicted_rate": round(predicted_rate, 4),
@@ -535,6 +628,13 @@ class FXPredictor:
             "api_provider": current_data.get("api_provider", "unknown"),
             "data_quality": current_data.get("data_quality", "unknown")
         }
+        
+        # 手動入力が必要な場合の追加情報
+        if current_data.get("manual_input_required", False):
+            result["manual_input_required"] = True
+            result["rate_info"] = current_data.get("rate_info", {})
+        
+        return result
     
     def _get_market_info(self, pair: str, timezone: str) -> Dict[str, Any]:
         """市場情報取得"""
@@ -562,31 +662,31 @@ class FXPredictor:
             return {"status": "error"}
     
     def predict_multi_day(self, pair: str, days: int = 10, use_business_days: bool = False,
-                         timezone: str = "UTC", country: str = "JP") -> List[Dict[str, Any]]:
-        """複数日予測"""
+                         timezone: str = "UTC", country: str = "JP", manual_rate: Optional[float] = None) -> List[Dict[str, Any]]:
+        """複数日予測（手動レート対応版）"""
         predictions = []
         for day in range(1, days + 1):
-            prediction = self.predict_rate(pair, day, use_business_days, timezone, country)
+            prediction = self.predict_rate(pair, day, use_business_days, timezone, country, manual_rate)
             predictions.append(prediction)
         return predictions
 
-# WebサーバーとHTMLテンプレートは同じ構造を維持
+# WebサーバーとHTMLテンプレート（手動レート入力UI追加）
 class FXWebServer:
-    """FXWebサーバー（Live API版）"""
+    """FXWebサーバー（手動レート対応版）"""
     
     def __init__(self, port: int = 8080):
         self.port = port
         self.predictor = FXPredictor()
         
     def get_html_template(self) -> str:
-        """HTMLテンプレート（Live API強化版）"""
+        """HTMLテンプレート（手動レート入力機能付き）"""
         return """
 <!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FX予測システム - Phase 2.2 Live API Edition</title>
+    <title>FX予測システム - Phase 2.2 Manual Rate Edition</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
@@ -647,15 +747,15 @@ class FXWebServer:
         }
         
         .feature-badge.live-api { background: rgba(76, 175, 80, 0.3); }
+        .feature-badge.manual-rate { background: rgba(255, 193, 7, 0.3); }
         .feature-badge.business-days { background: rgba(255, 152, 0, 0.3); }
         .feature-badge.timezone { background: rgba(156, 39, 176, 0.3); }
-        .feature-badge.enhanced { background: rgba(255, 87, 34, 0.3); }
         
         .content { padding: 30px; }
         
-        .live-api-notice {
-            background: linear-gradient(135deg, #e8f5e8, #f0f8f0);
-            border: 2px solid #4CAF50;
+        .manual-rate-notice {
+            background: linear-gradient(135deg, #fff3e0, #ffe0b2);
+            border: 2px solid #FF9800;
             border-radius: 10px;
             padding: 20px;
             margin-bottom: 25px;
@@ -679,7 +779,7 @@ class FXWebServer:
             color: #333;
         }
         
-        select, input {
+        select, input[type="number"], input[type="text"] {
             padding: 12px;
             border: 2px solid #ddd;
             border-radius: 8px;
@@ -701,6 +801,50 @@ class FXWebServer:
         
         .checkbox-group input[type="checkbox"] { width: auto; }
         
+        .manual-rate-section {
+            grid-column: 1 / -1;
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 10px;
+            display: none;
+        }
+        
+        .manual-rate-section.show {
+            display: block;
+        }
+        
+        .manual-rate-inputs {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .manual-rate-input {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .manual-rate-input label {
+            font-size: 0.9em;
+            margin-bottom: 5px;
+            color: #666;
+        }
+        
+        .manual-rate-input input {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .manual-rate-input .rate-info {
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 2px;
+        }
+        
         button {
             background: linear-gradient(135deg, #4CAF50, #45a049);
             color: white;
@@ -716,6 +860,22 @@ class FXWebServer:
         button:hover {
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(76, 175, 80, 0.3);
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .toggle-button {
+            background: linear-gradient(135deg, #FF9800, #F57C00);
+            margin-bottom: 10px;
+        }
+        
+        .toggle-button:hover {
+            box-shadow: 0 8px 20px rgba(255, 152, 0, 0.3);
         }
         
         .loading {
@@ -856,37 +1016,52 @@ class FXWebServer:
             border-radius: 8px;
             margin-bottom: 20px;
         }
+        
+        .manual-input-alert {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .error-message {
+            color: #dc3545;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
 
         @media (max-width: 768px) {
             .controls { grid-template-columns: 1fr; }
             .phase2-2-features { grid-template-columns: 1fr; }
             .rate-info { grid-template-columns: 1fr; }
             .indicators { grid-template-columns: repeat(3, 1fr); }
+            .manual-rate-inputs { grid-template-columns: 1fr; }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <div class="phase-badge">Live API 2.2</div>
+            <div class="phase-badge">Manual Rate 2.2</div>
             <h1>🚀 FX予測システム</h1>
-            <p>Live API統合・営業日計算・タイムゾーン対応・次世代為替予測</p>
+            <p>Live API + 手動レート設定・営業日計算・タイムゾーン対応</p>
             <div class="feature-badges">
-                <span class="feature-badge live-api">📡 Live API強化</span>
+                <span class="feature-badge live-api">📡 Live API</span>
+                <span class="feature-badge manual-rate">✏️ 手動レート設定</span>
                 <span class="feature-badge business-days">📅 営業日計算</span>
                 <span class="feature-badge timezone">🌍 タイムゾーン対応</span>
-                <span class="feature-badge enhanced">⚡ 接続強化</span>
             </div>
         </div>
         
         <div class="content">
-            <div class="live-api-notice">
-                <h3>📡 Live API強化版の特徴</h3>
+            <div class="manual-rate-notice">
+                <h3>✏️ 手動レート設定機能</h3>
                 <ul>
-                    <li><strong>🔄 4つのAPI統合:</strong> exchangerate-api, exchangerate.host, fxratesapi, vatcomply</li>
-                    <li><strong>⚡ 自動リトライ:</strong> タイムアウト・接続エラー時の自動再試行</li>
-                    <li><strong>🎯 確実なデータ取得:</strong> AWS App Runner環境で最適化</li>
-                    <li><strong>✅ データ品質保証:</strong> リアルタイム検証とフォールバック</li>
+                    <li><strong>📡 Live API優先:</strong> まず自動的にリアルタイムデータを取得</li>
+                    <li><strong>✏️ 手動入力オプション:</strong> API失敗時や正確な値を設定したい場合</li>
+                    <li><strong>🎯 高精度予測:</strong> 利用者設定レートによる信頼度向上</li>
+                    <li><strong>✅ 入力検証:</strong> 現実的な範囲内での値のみ受付</li>
                 </ul>
             </div>
             
@@ -936,26 +1111,118 @@ class FXWebServer:
                 
                 <div class="control-group">
                     <label>&nbsp;</label>
-                    <button onclick="makePrediction()" id="predictBtn">
-                        📈 Live API予測実行
+                    <button class="toggle-button" onclick="toggleManualRateInput()" id="toggleBtn">
+                        ✏️ 手動レート設定
                     </button>
+                </div>
+                
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button onclick="makePrediction()" id="predictBtn">
+                        📈 予測実行
+                    </button>
+                </div>
+                
+                <div class="manual-rate-section" id="manualRateSection">
+                    <h4>✏️ 現在レートの手動設定</h4>
+                    <p>正確な現在レートをご存知の場合、こちらで設定してください。</p>
+                    <div class="manual-rate-inputs">
+                        <div class="manual-rate-input">
+                            <label for="manualUSDJPY">USD/JPY 現在レート</label>
+                            <input type="number" id="manualUSDJPY" step="0.001" placeholder="例: 147.490">
+                            <div class="rate-info">範囲: 80.0 - 250.0 (小数点3桁)</div>
+                            <div class="error-message" id="errorUSDJPY"></div>
+                        </div>
+                        
+                        <div class="manual-rate-input">
+                            <label for="manualEURJPY">EUR/JPY 現在レート</label>
+                            <input type="number" id="manualEURJPY" step="0.0001" placeholder="例: 173.1600">
+                            <div class="rate-info">範囲: 100.0 - 300.0 (小数点4桁)</div>
+                            <div class="error-message" id="errorEURJPY"></div>
+                        </div>
+                        
+                        <div class="manual-rate-input">
+                            <label for="manualEURUSD">EUR/USD 現在レート</label>
+                            <input type="number" id="manualEURUSD" step="0.0001" placeholder="例: 1.1740">
+                            <div class="rate-info">範囲: 0.5 - 2.0 (小数点4桁)</div>
+                            <div class="error-message" id="errorEURUSD"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
             
             <div class="loading" id="loading">
-                <h3>🔄 Live API取得中...</h3>
-                <p>複数APIから最新データを取得・分析しています</p>
+                <h3>🔄 データ取得・予測計算中...</h3>
+                <p>Live API試行 → 手動レート確認 → 営業日・タイムゾーン分析</p>
             </div>
             
             <div id="results" class="results"></div>
         </div>
         
         <div class="footer">
-            <p>© 2024 FX Prediction System - Phase 2.2 Live API Edition | Real-time Data Integration</p>
+            <p>© 2024 FX Prediction System - Phase 2.2 Manual Rate Edition | User-Configurable Real-time Data</p>
         </div>
     </div>
 
     <script>
+        let manualRateMode = false;
+        
+        function toggleManualRateInput() {
+            const section = document.getElementById('manualRateSection');
+            const toggleBtn = document.getElementById('toggleBtn');
+            
+            manualRateMode = !manualRateMode;
+            
+            if (manualRateMode) {
+                section.classList.add('show');
+                toggleBtn.textContent = '📡 自動取得に戻す';
+                toggleBtn.style.background = 'linear-gradient(135deg, #2196F3, #1976D2)';
+            } else {
+                section.classList.remove('show');
+                toggleBtn.textContent = '✏️ 手動レート設定';
+                toggleBtn.style.background = 'linear-gradient(135deg, #FF9800, #F57C00)';
+                clearManualInputs();
+            }
+        }
+        
+        function clearManualInputs() {
+            document.getElementById('manualUSDJPY').value = '';
+            document.getElementById('manualEURJPY').value = '';
+            document.getElementById('manualEURUSD').value = '';
+            clearErrorMessages();
+        }
+        
+        function clearErrorMessages() {
+            document.getElementById('errorUSDJPY').textContent = '';
+            document.getElementById('errorEURJPY').textContent = '';
+            document.getElementById('errorEURUSD').textContent = '';
+        }
+        
+        function validateManualRate(pair, value) {
+            const ranges = {
+                'USD/JPY': { min: 80, max: 250, decimal: 3 },
+                'EUR/JPY': { min: 100, max: 300, decimal: 4 },
+                'EUR/USD': { min: 0.5, max: 2.0, decimal: 4 }
+            };
+            
+            if (!value || value === '') {
+                return { valid: true, value: null };
+            }
+            
+            const rate = parseFloat(value);
+            const range = ranges[pair];
+            
+            if (isNaN(rate)) {
+                return { valid: false, error: '数値を入力してください' };
+            }
+            
+            if (rate < range.min || rate > range.max) {
+                return { valid: false, error: `${range.min} - ${range.max} の範囲で入力してください` };
+            }
+            
+            return { valid: true, value: rate };
+        }
+        
         async function makePrediction() {
             const currencyPair = document.getElementById('currencyPair').value;
             const predictionDays = parseInt(document.getElementById('predictionDays').value);
@@ -965,17 +1232,46 @@ class FXWebServer:
             const results = document.getElementById('results');
             const predictBtn = document.getElementById('predictBtn');
             
+            // エラーメッセージクリア
+            clearErrorMessages();
+            
+            // 手動レートの検証
+            let manualRate = null;
+            if (manualRateMode) {
+                const manualValue = document.getElementById('manual' + currencyPair.replace('/', '')).value;
+                const validation = validateManualRate(currencyPair, manualValue);
+                
+                if (!validation.valid && manualValue !== '') {
+                    document.getElementById('error' + currencyPair.replace('/', '')).textContent = validation.error;
+                    return;
+                }
+                
+                manualRate = validation.value;
+            }
+            
+            // UI更新
             loading.classList.add('show');
             results.innerHTML = '';
             predictBtn.disabled = true;
-            predictBtn.textContent = 'Live API取得中...';
+            predictBtn.textContent = '計算中...';
             
             try {
                 let url;
+                const params = new URLSearchParams({
+                    pair: currencyPair,
+                    days: predictionDays,
+                    timezone: timezone,
+                    use_business_days: useBusinessDays
+                });
+                
+                if (manualRate !== null) {
+                    params.append('manual_rate', manualRate);
+                }
+                
                 if (predictionDays === 1) {
-                    url = `/api/predict?pair=${encodeURIComponent(currencyPair)}&days=${predictionDays}&timezone=${timezone}&use_business_days=${useBusinessDays}`;
+                    url = `/api/predict?` + params.toString();
                 } else {
-                    url = `/api/predict_multi?pair=${encodeURIComponent(currencyPair)}&days=${predictionDays}&timezone=${timezone}&use_business_days=${useBusinessDays}`;
+                    url = `/api/predict_multi?` + params.toString();
                 }
                 
                 const response = await fetch(url);
@@ -1002,7 +1298,7 @@ class FXWebServer:
             } finally {
                 loading.classList.remove('show');
                 predictBtn.disabled = false;
-                predictBtn.textContent = '📈 Live API予測実行';
+                predictBtn.textContent = '📈 予測実行';
             }
         }
         
@@ -1011,9 +1307,41 @@ class FXWebServer:
             const changeClass = data.change >= 0 ? 'positive' : 'negative';
             const changeSymbol = data.change >= 0 ? '+' : '';
             
-            const dataSourceIcon = data.current_data_source === 'Live API' ? '📡' : 
-                                   data.current_data_source === 'High-Quality Simulation' ? '🔄' : '🔄';
-            const dataSourceText = data.current_data_source || 'Unknown';
+            // データソースアイコンと説明
+            let dataSourceIcon, dataSourceText;
+            switch(data.current_data_source) {
+                case 'Live API':
+                    dataSourceIcon = '📡';
+                    dataSourceText = 'Live API データ';
+                    break;
+                case 'Manual Input':
+                    dataSourceIcon = '✏️';
+                    dataSourceText = '手動入力データ';
+                    break;
+                case 'Manual Input Required':
+                    dataSourceIcon = '⚠️';
+                    dataSourceText = '手動入力が必要';
+                    break;
+                default:
+                    dataSourceIcon = '🔄';
+                    dataSourceText = data.current_data_source || 'Unknown';
+            }
+            
+            // 手動入力が必要な場合の警告表示
+            let manualInputAlert = '';
+            if (data.manual_input_required) {
+                const rateInfo = data.rate_info || {};
+                manualInputAlert = `
+                    <div class="manual-input-alert">
+                        <h4>⚠️ より正確な予測のために</h4>
+                        <p>Live APIでのデータ取得に失敗しました。より正確な予測を行うために、現在の正確なレートを手動で設定することをお勧めします。</p>
+                        <p><strong>推奨範囲:</strong> ${rateInfo.min || 'N/A'} - ${rateInfo.max || 'N/A'} (${rateInfo.example || 'N/A'})</p>
+                        <button onclick="toggleManualRateInput()" style="margin-top: 10px; padding: 8px 16px; font-size: 14px;">
+                            ✏️ 手動レート設定を開く
+                        </button>
+                    </div>
+                `;
+            }
             
             results.innerHTML = `
                 <div class="prediction-card">
@@ -1021,6 +1349,8 @@ class FXWebServer:
                         <div class="currency-pair">${document.getElementById('currencyPair').value}</div>
                         <div class="confidence">信頼度: ${data.confidence}%</div>
                     </div>
+                    
+                    ${manualInputAlert}
                     
                     <div class="phase2-2-features">
                         <div class="feature-info">
@@ -1035,11 +1365,13 @@ class FXWebServer:
                             <h4>📅 予測日程</h4>
                             <p>目標日: ${data.target_date}</p>
                             <p>${data.use_business_days ? '営業日ベース' : '暦日ベース'}: ${data.days_ahead}日後</p>
+                            ${data.actual_days !== data.days_ahead ? `<small>実際の日数: ${data.actual_days}日</small>` : ''}
                         </div>
                         
                         <div class="feature-info">
                             <h4>🌍 タイムゾーン</h4>
                             <p>${data.timezone}</p>
+                            ${data.localized_timestamp ? `<p>現地時間: ${new Date(data.localized_timestamp).toLocaleString('ja-JP')}</p>` : ''}
                         </div>
                     </div>
                     
@@ -1083,15 +1415,67 @@ class FXWebServer:
         }
         
         function displayMultiDayPrediction(data) {
-            // 複数日予測の表示（同様の構造）
             const results = document.getElementById('results');
             const currencyPair = document.getElementById('currencyPair').value;
+            const useBusinessDays = document.getElementById('useBusinessDays').checked;
+            
+            const firstPrediction = data[0];
+            const dataSourceIcon = firstPrediction.current_data_source === 'Live API' ? '📡' : 
+                                   firstPrediction.current_data_source === 'Manual Input' ? '✏️' : '🔄';
+            const dataSourceText = firstPrediction.current_data_source || 'Unknown';
             
             let html = `
                 <div class="prediction-card">
                     <div class="prediction-header">
-                        <div class="currency-pair">${currencyPair} - Live API複数日予測</div>
+                        <div class="currency-pair">${currencyPair} - 複数日予測</div>
                         <div class="confidence">予測期間: ${data.length}日間</div>
+                    </div>
+                    
+                    <div class="phase2-2-features">
+                        <div class="feature-info">
+                            <h4>📡 データソース</h4>
+                            <p>${dataSourceIcon} ${dataSourceText}</p>
+                            ${firstPrediction.api_provider ? `<small>API: ${firstPrediction.api_provider}</small>` : ''}
+                        </div>
+                        
+                        <div class="feature-info">
+                            <h4>📅 計算方式</h4>
+                            <p>${useBusinessDays ? '営業日ベース計算' : '暦日ベース計算'}</p>
+                        </div>
+                        
+                        <div class="feature-info">
+                            <h4>🌍 タイムゾーン</h4>
+                            <p>${firstPrediction.timezone}</p>
+                        </div>
+                    </div>
+                    
+                    <div class="multi-day-results">
+            `;
+            
+            data.forEach((prediction, index) => {
+                const changeClass = prediction.change >= 0 ? 'positive' : 'negative';
+                const changeSymbol = prediction.change >= 0 ? '+' : '';
+                const businessDayInfo = prediction.use_business_days && prediction.actual_days !== prediction.days_ahead 
+                    ? ` (実${prediction.actual_days}日)` : '';
+                
+                html += `
+                    <div class="day-prediction">
+                        <div class="day-info">
+                            <div class="day-date">${prediction.target_date}</div>
+                            <div class="day-number">${prediction.days_ahead}日後${businessDayInfo}</div>
+                        </div>
+                        
+                        <div class="prediction-info">
+                            <div class="predicted-rate">${prediction.predicted_rate}</div>
+                            <div class="prediction-change ${changeClass}">
+                                ${changeSymbol}${prediction.change} (${changeSymbol}${prediction.change_percent}%)
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            html += `
                     </div>
                 </div>
             `;
@@ -1109,7 +1493,7 @@ class FXWebServer:
         """
 
 class FXRequestHandler(http.server.BaseHTTPRequestHandler):
-    """HTTPリクエストハンドラー（Live API版）"""
+    """HTTPリクエストハンドラー（手動レート対応版）"""
     
     def __init__(self, predictor, *args, **kwargs):
         self.predictor = predictor
@@ -1145,7 +1529,15 @@ class FXRequestHandler(http.server.BaseHTTPRequestHandler):
             use_business_days = params.get('use_business_days', ['false'])[0].lower() == 'true'
             country = params.get('country', ['JP'])[0]
             
-            prediction = self.predictor.predict_rate(pair, days, use_business_days, timezone, country)
+            # 手動レートパラメータ
+            manual_rate = None
+            if 'manual_rate' in params:
+                try:
+                    manual_rate = float(params['manual_rate'][0])
+                except (ValueError, IndexError):
+                    manual_rate = None
+            
+            prediction = self.predictor.predict_rate(pair, days, use_business_days, timezone, country, manual_rate)
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -1171,7 +1563,15 @@ class FXRequestHandler(http.server.BaseHTTPRequestHandler):
             use_business_days = params.get('use_business_days', ['false'])[0].lower() == 'true'
             country = params.get('country', ['JP'])[0]
             
-            predictions = self.predictor.predict_multi_day(pair, days, use_business_days, timezone, country)
+            # 手動レートパラメータ
+            manual_rate = None
+            if 'manual_rate' in params:
+                try:
+                    manual_rate = float(params['manual_rate'][0])
+                except (ValueError, IndexError):
+                    manual_rate = None
+            
+            predictions = self.predictor.predict_multi_day(pair, days, use_business_days, timezone, country, manual_rate)
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -1195,18 +1595,18 @@ def create_handler(predictor):
     return handler
 
 def main():
-    """メイン実行関数（Live API強化版）"""
+    """メイン実行関数（手動レート対応版）"""
     try:
         port = int(os.environ.get('PORT', 8080))
         
-        print(f"🚀 FX予測システム - Phase 2.2 Live API Edition 起動中...")
+        print(f"🚀 FX予測システム - Phase 2.2 Manual Rate Edition 起動中...")
         print(f"📡 ポート: {port}")
         print(f"⏰ 起動時刻: {datetime.datetime.now().isoformat()}")
         
         if REQUESTS_AVAILABLE:
-            print("✅ requests利用可能 - Live API機能フル稼働")
+            print("✅ requests利用可能 - Live API + 手動レート機能フル稼働")
         else:
-            print("⚠️ requests不可 - urllib fallback mode")
+            print("⚠️ requests不可 - urllib + 手動レート fallback mode")
             
         if DATEUTIL_AVAILABLE:
             print("✅ python-dateutil利用可能 - 営業日・タイムゾーン機能フル稼働")
@@ -1214,30 +1614,29 @@ def main():
             print("⚠️ python-dateutil不可 - 基本日付処理モード")
         
         predictor = FXPredictor()
-        print("✅ Live API統合予測エンジン初期化完了")
+        print("✅ Live API + 手動レート統合予測エンジン初期化完了")
         
-        # Live API機能テスト
-        print("🧪 Live API統合テスト実行中...")
+        # 機能テスト
+        print("🧪 手動レート機能テスト実行中...")
         test_prediction = predictor.predict_rate("USD/JPY", 1, timezone="Tokyo")
         print(f"🧪 テスト結果: USD/JPY = {test_prediction['predicted_rate']}")
         print(f"📊 データソース: {test_prediction['current_data_source']}")
-        print(f"🔗 API プロバイダー: {test_prediction.get('api_provider', 'N/A')}")
-        print(f"🏆 データ品質: {test_prediction.get('data_quality', 'N/A')}")
+        print(f"✏️ 手動入力必要: {test_prediction.get('manual_input_required', False)}")
         print("=" * 50)
         
         handler = create_handler(predictor)
         with socketserver.TCPServer(("", port), handler) as httpd:
-            print(f"🌐 Live API サーバー起動完了: http://0.0.0.0:{port}")
-            print("📡 複数API統合 - リアルタイムデータ取得準備完了")
+            print(f"🌐 Live API + 手動レート サーバー起動完了: http://0.0.0.0:{port}")
+            print("📡 複数API統合 + ✏️ 利用者レート設定対応")
             print("🔄 リクエスト待機中...")
             print("=" * 50)
             
             httpd.serve_forever()
             
     except KeyboardInterrupt:
-        print("\n🛑 Live API サーバー停止中...")
+        print("\n🛑 Manual Rate サーバー停止中...")
     except Exception as e:
-        print(f"❌ Live API サーバーエラー: {e}")
+        print(f"❌ Manual Rate サーバーエラー: {e}")
         raise
 
 if __name__ == "__main__":
